@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+import logging
 from collections.abc import Callable
 from typing import TypeVar
 
@@ -607,11 +608,28 @@ class LoRAModelManager:
                     replacement_loras = self._pad_lora_pairs_to_triplets(
                         replacement_loras
                     )
-                lora_model.loras[module_name] = PackedLoRALayerWeights.pack_moe(
+                packed_lora = PackedLoRALayerWeights.pack_moe(
                     replacement_loras,
                     module_name,
                     is_non_gated_moe=self._is_non_gated_moe,
                 )
+                lora_model.loras[module_name] = packed_lora
+                if logger.isEnabledFor(logging.INFO):
+                    assert isinstance(packed_lora.lora_a, list)
+                    assert isinstance(packed_lora.lora_b, list)
+                    logger.info(
+                        "Packed expert MoE LoRA module=%s lora_a_shapes=%s "
+                        "lora_b_shapes=%s",
+                        module_name,
+                        [
+                            tuple(t.shape) if torch.is_tensor(t) else None
+                            for t in packed_lora.lora_a
+                        ],
+                        [
+                            tuple(t.shape) if torch.is_tensor(t) else None
+                            for t in packed_lora.lora_b
+                        ],
+                    )
             else:
                 lora_model.loras[module_name] = PackedLoRALayerWeights.pack(
                     replacement_loras

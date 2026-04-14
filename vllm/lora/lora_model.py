@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
 import os
 
 import safetensors
@@ -117,6 +118,26 @@ class LoRAModel:
 
                 if pin_memory:
                     loras[module_name].lora_b = loras[module_name].lora_b.pin_memory()
+
+            if logger.isEnabledFor(logging.INFO) and ".experts" in module_name:
+                lora_weight = loras[module_name]
+                logger.info(
+                    "Loaded expert LoRA tensor module=%s tensor=%s is_lora_a=%s "
+                    "lora_a_shape=%s lora_b_shape=%s",
+                    module_name,
+                    tensor_name,
+                    is_lora_a,
+                    (
+                        tuple(lora_weight.lora_a.shape)
+                        if torch.is_tensor(lora_weight.lora_a)
+                        else None
+                    ),
+                    (
+                        tuple(lora_weight.lora_b.shape)
+                        if torch.is_tensor(lora_weight.lora_b)
+                        else None
+                    ),
+                )
 
         return cls(lora_model_id, peft_helper.r, loras)
 

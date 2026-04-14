@@ -533,29 +533,154 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         lora_b: torch.Tensor | list[torch.Tensor],
     ):
         """Overwrites lora tensors at index."""
-        # Make mypy happy
-        assert isinstance(lora_a, list)
-        assert isinstance(lora_b, list)
+        if not isinstance(lora_a, list) or not isinstance(lora_b, list):
+            raise ValueError("FusedMoE LoRA expects list-based LoRA tensors.")
+        if len(lora_a) != 3 or len(lora_b) != 3:
+            raise ValueError(
+                "FusedMoE LoRA expects exactly 3 tensors for A and B "
+                "(w1, w2, w3)."
+            )
 
         self.reset_lora(index)
         self.adapter_enabled[index] = 1
 
         num_experts = self.w13_lora_a_stacked[0].shape[1]
+        rank_capacity_w13 = self.w13_lora_a_stacked[0].shape[2]
+        rank_capacity_w2 = self.w2_lora_a_stacked[0].shape[2]
+        hidden_size = self.base_layer.hidden_size
 
         w1_lora_a, w2_lora_a, w3_lora_a = lora_a
         w1_lora_b, w2_lora_b, w3_lora_b = lora_b
-        assert (
+        if not all(torch.is_tensor(t) for t in lora_a + lora_b):
+            raise ValueError("FusedMoE LoRA expects all A/B entries to be tensors.")
+
+        for tensor_name, tensor in (
+            ("w1_lora_a", w1_lora_a),
+            ("w2_lora_a", w2_lora_a),
+            ("w3_lora_a", w3_lora_a),
+            ("w1_lora_b", w1_lora_b),
+            ("w2_lora_b", w2_lora_b),
+            ("w3_lora_b", w3_lora_b),
+        ):
+            if tensor.ndim != 3:
+                raise ValueError(
+                    f"{tensor_name} must be 3D "
+                    f"(num_experts, *, *), got shape {tuple(tensor.shape)}."
+                )
+
+        if not (
             num_experts
             == w1_lora_a.shape[0]
             == w2_lora_a.shape[0]
             == w3_lora_a.shape[0]
-        )
+            == w1_lora_b.shape[0]
+            == w2_lora_b.shape[0]
+            == w3_lora_b.shape[0]
+        ):
+            raise ValueError(
+                "LoRA expert count mismatch: expected "
+                f"{num_experts}, got "
+                f"w1_a={w1_lora_a.shape[0]}, w2_a={w2_lora_a.shape[0]}, "
+                f"w3_a={w3_lora_a.shape[0]}, w1_b={w1_lora_b.shape[0]}, "
+                f"w2_b={w2_lora_b.shape[0]}, w3_b={w3_lora_b.shape[0]}."
+            )
+
+        if w1_lora_a.shape[2] != hidden_size or w3_lora_a.shape[2] != hidden_size:
+            raise ValueError(
+                "LoRA hidden-size mismatch for w1/w3: expected input dim "
+                f"{hidden_size}, got w1={w1_lora_a.shape[2]}, w3={w3_lora_a.shape[2]}."
+            )
+
+        if w1_lora_a.shape[1] != w1_lora_b.shape[2]:
+            raise ValueError(
+                "LoRA rank mismatch for w1: "
+                f"lora_a rank={w1_lora_a.shape[1]}, lora_b rank={w1_lora_b.shape[2]}."
+            )
+        if w2_lora_a.shape[1] != w2_lora_b.shape[2]:
+            raise ValueError(
+                "LoRA rank mismatch for w2: "
+                f"lora_a rank={w2_lora_a.shape[1]}, lora_b rank={w2_lora_b.shape[2]}."
+            )
+        if w3_lora_a.shape[1] != w3_lora_b.shape[2]:
+            raise ValueError(
+                "LoRA rank mismatch for w3: "
+                f"lora_a rank={w3_lora_a.shape[1]}, lora_b rank={w3_lora_b.shape[2]}."
+            )
+
+        # W13/W1/W3 rank is potentially sharded by TP only in fully-sharded mode.
+        if (
+            self.fully_sharded
+            and self.tp_size > 1
+            and w1_lora_a.shape[1] % self.tp_size != 0
+        ):
+            raise ValueError(
+                "w1 LoRA rank must be divisible by tensor parallel size when "
+                "fully-sharded LoRA is enabled: "
+                f"rank={w1_lora_a.shape[1]}, tp_size={self.tp_size}."
+            )
+        if (
+            self.fully_sharded
+            and self.tp_size > 1
+            and w3_lora_a.shape[1] % self.tp_size != 0
+        ):
+            raise ValueError(
+                "w3 LoRA rank must be divisible by tensor parallel size when "
+                "fully-sharded LoRA is enabled: "
+                f"rank={w3_lora_a.shape[1]}, tp_size={self.tp_size}."
+            )
+
+        # W2 A input dimension is sharded across TP ranks.
+        if self.tp_size > 1 and w2_lora_a.shape[2] % self.tp_size != 0:
+            raise ValueError(
+                "w2 LoRA input dim must be divisible by tensor parallel size: "
+                f"input_dim={w2_lora_a.shape[2]}, tp_size={self.tp_size}."
+            )
+
+        # W13 B output dimension is sharded across TP ranks.
+        if self.tp_size > 1 and w1_lora_b.shape[1] % self.tp_size != 0:
+            raise ValueError(
+                "w1 LoRA output dim must be divisible by tensor parallel size: "
+                f"output_dim={w1_lora_b.shape[1]}, tp_size={self.tp_size}."
+            )
+        if self.tp_size > 1 and w3_lora_b.shape[1] % self.tp_size != 0:
+            raise ValueError(
+                "w3 LoRA output dim must be divisible by tensor parallel size: "
+                f"output_dim={w3_lora_b.shape[1]}, tp_size={self.tp_size}."
+            )
+
+        # W2 B output dimension is sharded only for fully-sharded LoRA.
+        if (
+            self.fully_sharded
+            and self.tp_size > 1
+            and w2_lora_b.shape[1] % self.tp_size != 0
+        ):
+            raise ValueError(
+                "w2 LoRA output dim must be divisible by tensor parallel size "
+                "when fully-sharded LoRA is enabled: "
+                f"output_dim={w2_lora_b.shape[1]}, tp_size={self.tp_size}."
+            )
 
         slliced_w1_lora_a = self._slice_w13_a(w1_lora_a)
         slliced_w1_lora_b = self._slice_w13_b(w1_lora_b)
 
         sliced_w2_lora_a = self._slice_w2_a(w2_lora_a)
         sliced_w2_lora_b = self._slice_w2_b(w2_lora_b)
+        slliced_w3_lora_a = self._slice_w13_a(w3_lora_a)
+        slliced_w3_lora_b = self._slice_w13_b(w3_lora_b)
+
+        if (
+            slliced_w1_lora_a.shape[1] > rank_capacity_w13
+            or slliced_w3_lora_a.shape[1] > rank_capacity_w13
+            or sliced_w2_lora_a.shape[1] > rank_capacity_w2
+        ):
+            raise ValueError(
+                "LoRA rank exceeds configured max rank capacity after TP slicing: "
+                f"w1={slliced_w1_lora_a.shape[1]}, "
+                f"w2={sliced_w2_lora_a.shape[1]}, "
+                f"w3={slliced_w3_lora_a.shape[1]}, "
+                f"w13_capacity={rank_capacity_w13}, "
+                f"w2_capacity={rank_capacity_w2}."
+            )
 
         self.w13_lora_a_stacked[0][
             index, :, : slliced_w1_lora_a.shape[1], : slliced_w1_lora_a.shape[2]
@@ -567,9 +692,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         # Only copy w3 (up_proj) for gated MoE (_w13_slices == 2)
         if self._w13_slices == 2:
-            slliced_w3_lora_a = self._slice_w13_a(w3_lora_a)
-            slliced_w3_lora_b = self._slice_w13_b(w3_lora_b)
-
             self.w13_lora_a_stacked[1][
                 index, :, : slliced_w3_lora_a.shape[1], : slliced_w3_lora_a.shape[2]
             ].copy_(slliced_w3_lora_a, non_blocking=True)
