@@ -71,6 +71,12 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             device=device,
             captured_lora_counts=captured_lora_counts,
         )
+        # Reuse MoE alignment buffers to keep addresses stable and avoid repeated
+        # allocations for identical shape signatures.
+        self._moe_align_buffers: dict[
+            tuple[int, int, int, bool, torch.device],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
 
     def update_metadata(
         self,
@@ -355,21 +361,33 @@ class PunicaWrapperGPU(PunicaWrapperBase):
                 max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
             if topk_ids.numel() < num_experts:
                 max_num_tokens_padded = topk_ids.numel() * block_size
-            sorted_ids = torch.empty(
-                (max_loras * max_num_tokens_padded,),
-                dtype=torch.int32,
-                device=topk_ids.device,
-            )
             max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
-            # Expert ids must be set default to -1 to prevent a blank block
-            expert_ids = torch.empty(
-                (max_loras * max_num_m_blocks,),
-                dtype=torch.int32,
-                device=topk_ids.device,
+            cache_key = (
+                max_loras,
+                max_num_tokens_padded,
+                max_num_m_blocks,
+                pad_sorted_ids,
+                topk_ids.device,
             )
-            num_tokens_post_pad = torch.empty(
-                (max_loras), dtype=torch.int32, device=topk_ids.device
-            )
+            if cache_key not in self._moe_align_buffers:
+                # These tensors are output-only and overwritten by the op.
+                self._moe_align_buffers[cache_key] = (
+                    torch.empty(
+                        (max_loras * max_num_tokens_padded,),
+                        dtype=torch.int32,
+                        device=topk_ids.device,
+                    ),
+                    # Expert ids are output-only and overwritten by the op.
+                    torch.empty(
+                        (max_loras * max_num_m_blocks,),
+                        dtype=torch.int32,
+                        device=topk_ids.device,
+                    ),
+                    torch.empty((max_loras), dtype=torch.int32, device=topk_ids.device),
+                )
+            sorted_ids, expert_ids, num_tokens_post_pad = self._moe_align_buffers[
+                cache_key
+            ]
 
             ops.moe_lora_align_block_size(
                 topk_ids,
