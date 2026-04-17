@@ -281,5 +281,130 @@ def test_moe_lora_align_block_size_mixed_base_and_lora(
             )
 
 
+@pytest.mark.parametrize("max_loras", [1, 2])
+@pytest.mark.parametrize("num_experts", [64, 128])
+@pytest.mark.parametrize("topk_num", [6])
+@pytest.mark.parametrize("block_size", [16])
+def test_moe_lora_align_block_size_disabled_adapter_untouched(
+    max_loras, num_experts, topk_num, block_size
+):
+    """Disabled adapter slot must not be touched by any of the three align kernels.
+
+    Constructs a batch where slot 0 is present in `active_lora_ids` (i.e. tokens
+    are routed to it from `token_lora_mapping`) but `adapter_enabled[0] == 0`.
+    The align kernel (`moe_lora_align_block_size_kernel`) already early-returns
+    for disabled adapters, leaving `token_mask` uninitialized for that row.
+    Before this test / guard, the sort kernel
+    (`lora_count_and_sort_expert_tokens_kernel`) did not check
+    `adapter_enabled` and would traverse that garbage mask, polluting
+    `sorted_token_ids` and `cumsum_buffer` for the disabled slot. The pollution
+    was dormant (downstream consumers also skip disabled slots), but it breaks
+    the expected invariant that disabled-slot output rows remain untouched.
+
+    This test pins that invariant by initializing the output buffers with
+    distinctive sentinels and asserting the disabled-slot rows are *unchanged*
+    after the op completes.
+    """
+    random.seed(2)
+
+    num_tokens = 16
+    topk_ids = torch.zeros((num_tokens, topk_num), dtype=torch.int32)
+    token_lora_mapping = torch.zeros((num_tokens,), dtype=torch.int32)
+    for i in range(num_tokens):
+        pool = list(range(num_experts))
+        random.shuffle(pool)
+        for j in range(topk_num):
+            topk_ids[i, j] = pool[j]
+        # Route every token to the disabled slot 0 so that slot 0 actually
+        # appears in active_lora_ids (otherwise the -1 / >=max_loras guards
+        # alone would make this test uninteresting).
+        token_lora_mapping[i] = 0
+
+    topk_ids = topk_ids.to(DEVICE_TYPE)
+    token_lora_mapping = token_lora_mapping.to(DEVICE_TYPE)
+
+    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+    max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
+    if topk_ids.numel() < num_experts:
+        max_num_tokens_padded = topk_ids.numel() * block_size
+    max_num_m_blocks = CEILDIV(max_num_tokens_padded, block_size)
+
+    lora_ids = torch.full((max_loras + 1,), -1, dtype=torch.int32, device=DEVICE_TYPE)
+    unique_ids = torch.unique(token_lora_mapping, sorted=True)
+    lora_ids[: unique_ids.numel()] = unique_ids.to(torch.int32)
+    # Slot 0 is present in active_lora_ids...
+    assert (lora_ids == 0).any().item(), "test setup requires slot 0 to be active"
+
+    # ...but disabled.
+    adapter_enabled = torch.ones(
+        (max_loras + 1,), dtype=torch.int32, device=DEVICE_TYPE
+    )
+    adapter_enabled[0] = 0
+
+    SENTINEL_EXPERT = -2
+    SENTINEL_TOKEN = -7
+    SENTINEL_NPAD = -13
+
+    sorted_token_ids = torch.full(
+        (max_loras * max_num_tokens_padded,),
+        SENTINEL_TOKEN,
+        dtype=torch.int32,
+        device=DEVICE_TYPE,
+    )
+    expert_ids = torch.full(
+        (max_loras * max_num_m_blocks,),
+        SENTINEL_EXPERT,
+        dtype=torch.int32,
+        device=DEVICE_TYPE,
+    )
+    num_tokens_post_pad = torch.full(
+        (max_loras,), SENTINEL_NPAD, dtype=torch.int32, device=DEVICE_TYPE
+    )
+
+    ops.moe_lora_align_block_size(
+        topk_ids,
+        token_lora_mapping,
+        num_experts,
+        block_size,
+        max_loras,
+        max_num_tokens_padded,
+        max_num_m_blocks,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        adapter_enabled,
+        lora_ids,
+    )
+
+    # Disabled slot 0: output rows must be completely untouched.
+    #
+    # num_tokens_post_pad[0] must remain at the sentinel; a non-sentinel
+    # value would indicate the align kernel ran for the disabled slot.
+    assert num_tokens_post_pad[0].item() == SENTINEL_NPAD, (
+        f"num_tokens_post_pad[0]={num_tokens_post_pad[0].item()} was modified "
+        f"for a disabled adapter slot; the align kernel must skip "
+        f"adapter_enabled==0 slots."
+    )
+
+    # expert_ids row for slot 0: must remain all-sentinel.
+    expert_row0 = expert_ids.view(max_loras, -1)[0]
+    assert (expert_row0 == SENTINEL_EXPERT).all(), (
+        "expert_ids row for disabled slot 0 was partially written; the align "
+        "kernel must skip adapter_enabled==0 slots."
+    )
+
+    # sorted_token_ids row for slot 0: must remain all-sentinel. This is the
+    # assertion the sort-kernel guard specifically protects: without the
+    # adapter_enabled check in lora_count_and_sort_expert_tokens_kernel, the
+    # sort kernel reads uninitialized token_mask values and writes indices
+    # into this row.
+    sorted_row0 = sorted_token_ids.view(max_loras, -1)[0]
+    assert (sorted_row0 == SENTINEL_TOKEN).all(), (
+        "sorted_token_ids row for disabled slot 0 was polluted by the sort "
+        "kernel; lora_count_and_sort_expert_tokens_kernel must skip "
+        "adapter_enabled==0 slots."
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

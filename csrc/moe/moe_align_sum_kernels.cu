@@ -426,14 +426,21 @@ __global__ void lora_count_and_sort_expert_tokens_kernel(
     int32_t* __restrict__ sorted_token_ids, int32_t* __restrict__ cumsum_buffer,
     int32_t* __restrict__ expert_map, size_t numel, int32_t num_experts,
     int32_t max_num_tokens_padded, int32_t topk_num, int32_t* token_mask,
-    int32_t max_loras, int32_t* lora_ids, bool has_expert_map) {
+    int32_t max_loras, int32_t* lora_ids, int32_t* adapter_enabled,
+    bool has_expert_map) {
   int lora_idx = blockIdx.x;
   int lora_id = lora_ids[lora_idx];
-  // Same guard rationale as moe_lora_align_block_size_kernel: the grid
-  // iterates max_loras + 1 slots, and output buffers are indexed by lora_id
-  // in [0, max_loras), so skip both the "-1" padding entry and any
-  // unexpected lora_id >= max_loras.
-  if (lora_id == -1 || lora_id >= max_loras) {
+  // Same guard rationale as moe_lora_align_block_size_kernel. Additionally
+  // skip disabled adapter slots: moe_lora_align_block_size_kernel early-returns
+  // for them and leaves token_mask[lora_id, :] uninitialized (token_mask is
+  // allocated with torch::empty), so running the sort loop here would traverse
+  // garbage mask bits and pollute this slot's rows of sorted_token_ids and
+  // cumsum_buffer. Downstream consumers already skip disabled slots, so the
+  // pollution is dormant today, but the check keeps behavior symmetric with
+  // the other two align kernels and avoids O(numel) wasted work per disabled
+  // slot. Short-circuit evaluation ensures adapter_enabled is only indexed
+  // after lora_id is confirmed to be in [0, max_loras).
+  if (lora_id == -1 || lora_id >= max_loras || adapter_enabled[lora_id] == 0) {
     return;
   }
 
@@ -782,7 +789,8 @@ void moe_lora_align_block_size(
               sorted_token_ids.data_ptr<int32_t>(), cumsum.data_ptr<int32_t>(),
               expert_map.data_ptr<int32_t>(), topk_ids.numel(), num_experts,
               max_num_tokens_padded, topk_num, token_mask.data_ptr<int32_t>(),
-              max_loras, lora_ids.data_ptr<int32_t>(), has_expert_map);
+              max_loras, lora_ids.data_ptr<int32_t>(),
+              adapter_enabled.data_ptr<int32_t>(), has_expert_map);
         }
       });
 }
