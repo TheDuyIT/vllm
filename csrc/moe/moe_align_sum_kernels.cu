@@ -390,7 +390,13 @@ __global__ void moe_lora_align_block_size_kernel(
     int32_t* __restrict__ token_mask, bool has_expert_map) {
   int lora_idx = blockIdx.x / 2;
   int lora_id = lora_ids[lora_idx];
-  if (lora_id == -1 || adapter_enabled[lora_id] == 0) {
+  // Output buffers are indexed by lora_id (in [0, max_loras)). The grid
+  // iterates one extra slot to accommodate the "-1" entry that
+  // active_lora_ids may hold in position 0 for mixed base + LoRA batches;
+  // guard against any other unexpected lora_id >= max_loras to avoid
+  // out-of-bounds writes. This mirrors the `lora_id >= max_loras` guard in
+  // the Triton _fused_moe_lora_kernel.
+  if (lora_id == -1 || lora_id >= max_loras || adapter_enabled[lora_id] == 0) {
     return;
   }
 
@@ -420,10 +426,14 @@ __global__ void lora_count_and_sort_expert_tokens_kernel(
     int32_t* __restrict__ sorted_token_ids, int32_t* __restrict__ cumsum_buffer,
     int32_t* __restrict__ expert_map, size_t numel, int32_t num_experts,
     int32_t max_num_tokens_padded, int32_t topk_num, int32_t* token_mask,
-    int32_t* lora_ids, bool has_expert_map) {
+    int32_t max_loras, int32_t* lora_ids, bool has_expert_map) {
   int lora_idx = blockIdx.x;
   int lora_id = lora_ids[lora_idx];
-  if (lora_id == -1) {
+  // Same guard rationale as moe_lora_align_block_size_kernel: the grid
+  // iterates max_loras + 1 slots, and output buffers are indexed by lora_id
+  // in [0, max_loras), so skip both the "-1" padding entry and any
+  // unexpected lora_id >= max_loras.
+  if (lora_id == -1 || lora_id >= max_loras) {
     return;
   }
 
@@ -446,7 +456,8 @@ __global__ void moe_lora_align_block_size_small_batch_expert_kernel(
     int32_t* token_mask, bool has_expert_map) {
   int lora_idx = blockIdx.x;
   int lora_id = lora_ids[lora_idx];
-  if (lora_id == -1 || adapter_enabled[lora_id] == 0) {
+  // Same guard rationale as moe_lora_align_block_size_kernel.
+  if (lora_id == -1 || lora_id >= max_loras || adapter_enabled[lora_id] == 0) {
     return;
   }
 
@@ -771,7 +782,7 @@ void moe_lora_align_block_size(
               sorted_token_ids.data_ptr<int32_t>(), cumsum.data_ptr<int32_t>(),
               expert_map.data_ptr<int32_t>(), topk_ids.numel(), num_experts,
               max_num_tokens_padded, topk_num, token_mask.data_ptr<int32_t>(),
-              lora_ids.data_ptr<int32_t>(), has_expert_map);
+              max_loras, lora_ids.data_ptr<int32_t>(), has_expert_map);
         }
       });
 }
