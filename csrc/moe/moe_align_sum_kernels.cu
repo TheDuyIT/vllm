@@ -698,7 +698,15 @@ void moe_lora_align_block_size(
                   scalar_t, fill_threads>;
           AT_CUDA_CHECK(VLLM_DevFuncAttribute_SET_MaxDynamicSharedMemorySize(
               (void*)kernel, shared_mem));
-          kernel<<<max_loras, blockDim, shared_mem, stream>>>(
+          // Grid size is (max_loras + 1) because active_lora_ids has length
+          // max_loras + 1: sorted-unique values of token_lora_mapping, which
+          // can include -1 (base-model tokens) in addition to up to max_loras
+          // real LoRA slots. Using max_loras would drop the real LoRA slot
+          // when -1 is present at position 0 and leave output buffers
+          // uninitialized, causing illegal memory accesses in downstream
+          // MoE-LoRA kernels. This mirrors the fix made for the Triton
+          // _fused_moe_lora_kernel grid in vllm-project/vllm#32277.
+          kernel<<<max_loras + 1, blockDim, shared_mem, stream>>>(
               topk_ids.data_ptr<scalar_t>(),
               token_lora_mapping.data_ptr<int32_t>(), block_size,
               expert_map.data_ptr<int32_t>(), num_experts, max_loras,
@@ -722,10 +730,17 @@ void moe_lora_align_block_size(
           auto align_kernel =
               vllm::moe::moe_lora_align_block_size_kernel<scalar_t>;
 
-          // launch two threadblocks for each lora
+          // Launch two threadblocks per LoRA slot, across max_loras + 1 slots
+          // to cover the extra "-1" (base-model tokens) entry that
+          // active_lora_ids may contain in addition to up to max_loras real
+          // LoRA slots. Using max_loras would drop the real LoRA slot when -1
+          // occupies position 0 and leave the output buffers uninitialized,
+          // causing illegal memory accesses downstream. Mirrors the grid fix
+          // applied to _fused_moe_lora_kernel in vllm-project/vllm#32277.
           // blockIdx.x % 2 == 0: counting experts and aligning
           // blockIdx.x % 2 == 1: filling sorted_token_ids
-          align_kernel<<<max_loras * 2, blockDim, shared_mem_size, stream>>>(
+          align_kernel<<<(max_loras + 1) * 2, blockDim, shared_mem_size,
+                         stream>>>(
               topk_ids.data_ptr<scalar_t>(),
               token_lora_mapping.data_ptr<int32_t>(), block_size,
               expert_map.data_ptr<int32_t>(), num_experts, max_loras,
@@ -744,7 +759,10 @@ void moe_lora_align_block_size(
           const int max_blocks = 65535;
           const int actual_blocks = std::min(num_blocks, max_blocks);
 
-          dim3 gridDims(max_loras, actual_blocks);
+          // Same rationale as align_kernel above: iterate over max_loras + 1
+          // slots so the sort kernel processes the real LoRA slot even when
+          // active_lora_ids has -1 at position 0.
+          dim3 gridDims(max_loras + 1, actual_blocks);
           auto sort_kernel =
               vllm::moe::lora_count_and_sort_expert_tokens_kernel<scalar_t>;
 
