@@ -37,6 +37,12 @@ class PunicaWrapperGPU(PunicaWrapperBase):
     Multi-LoRA, and to provide the interface for the punica triton kernel.
     """
 
+    # Bucket size (in number of M-blocks) used to round up cached buffer
+    # shapes for MoE alignment. Bucketing bounds the number of distinct cache
+    # entries created during CUDA graph capture so retained memory stays small
+    # regardless of shape variability.
+    _MOE_ALIGN_BLOCK_BUCKET_SIZE = 32
+
     def __init__(
         self,
         max_num_batched_tokens: int,
@@ -71,8 +77,11 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             device=device,
             captured_lora_counts=captured_lora_counts,
         )
-        # Reuse MoE alignment buffers to keep addresses stable and avoid repeated
-        # allocations for identical shape signatures.
+        # Reuse MoE alignment buffers during CUDA graph capture so the captured
+        # pointers stay valid on replay. Keys use bucketed shapes (see
+        # ``_MOE_ALIGN_BLOCK_BUCKET_SIZE``) to bound the number of entries.
+        # In eager execution the cache is bypassed to avoid retained memory
+        # growth with variable token counts.
         self._moe_align_buffers: dict[
             tuple[int, int, int, bool, torch.device],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -362,32 +371,64 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             if topk_ids.numel() < num_experts:
                 max_num_tokens_padded = topk_ids.numel() * block_size
             max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
-            cache_key = (
-                max_loras,
-                max_num_tokens_padded,
-                max_num_m_blocks,
-                pad_sorted_ids,
-                topk_ids.device,
-            )
-            if cache_key not in self._moe_align_buffers:
-                # These tensors are output-only and overwritten by the op.
-                self._moe_align_buffers[cache_key] = (
-                    torch.empty(
-                        (max_loras * max_num_tokens_padded,),
-                        dtype=torch.int32,
-                        device=topk_ids.device,
-                    ),
-                    # Expert ids are output-only and overwritten by the op.
-                    torch.empty(
-                        (max_loras * max_num_m_blocks,),
-                        dtype=torch.int32,
-                        device=topk_ids.device,
-                    ),
-                    torch.empty((max_loras), dtype=torch.int32, device=topk_ids.device),
+
+            # Only retain buffers when a CUDA graph is being captured: the
+            # captured graph bakes in tensor addresses and needs them to stay
+            # valid on replay. In eager execution we allocate fresh tensors so
+            # memory is released after the call and scales with the live set
+            # of requests rather than the history of shapes seen.
+            if topk_ids.is_cuda and torch.cuda.is_current_stream_capturing():
+                # Bucket the requested shape so only a small, bounded set of
+                # distinct cache entries is created over the process lifetime.
+                bucket = self._MOE_ALIGN_BLOCK_BUCKET_SIZE
+                bucket_num_m_blocks = round_up(max_num_m_blocks, bucket)
+                bucket_num_tokens_padded = bucket_num_m_blocks * block_size
+                cache_key = (
+                    max_loras,
+                    bucket_num_tokens_padded,
+                    bucket_num_m_blocks,
+                    pad_sorted_ids,
+                    topk_ids.device,
                 )
-            sorted_ids, expert_ids, num_tokens_post_pad = self._moe_align_buffers[
-                cache_key
-            ]
+                if cache_key not in self._moe_align_buffers:
+                    # Output-only buffers; the op writes the first
+                    # ``max_num_tokens_padded`` / ``max_num_m_blocks`` entries.
+                    self._moe_align_buffers[cache_key] = (
+                        torch.empty(
+                            (max_loras * bucket_num_tokens_padded,),
+                            dtype=torch.int32,
+                            device=topk_ids.device,
+                        ),
+                        torch.empty(
+                            (max_loras * bucket_num_m_blocks,),
+                            dtype=torch.int32,
+                            device=topk_ids.device,
+                        ),
+                        torch.empty(
+                            (max_loras,),
+                            dtype=torch.int32,
+                            device=topk_ids.device,
+                        ),
+                    )
+                sorted_ids, expert_ids, num_tokens_post_pad = self._moe_align_buffers[
+                    cache_key
+                ]
+            else:
+                sorted_ids = torch.empty(
+                    (max_loras * max_num_tokens_padded,),
+                    dtype=torch.int32,
+                    device=topk_ids.device,
+                )
+                expert_ids = torch.empty(
+                    (max_loras * max_num_m_blocks,),
+                    dtype=torch.int32,
+                    device=topk_ids.device,
+                )
+                num_tokens_post_pad = torch.empty(
+                    (max_loras,),
+                    dtype=torch.int32,
+                    device=topk_ids.device,
+                )
 
             ops.moe_lora_align_block_size(
                 topk_ids,
