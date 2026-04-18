@@ -97,6 +97,23 @@ ARG PYTHON_VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Environment for uv
+# Declared BEFORE the installer + `uv venv` invocations below so the uv
+# binary, managed Python, download cache, and /opt/venv all land under
+# /opt/uv instead of /root/.local/. Without this, the venv created at
+# build time hardlinks back to /root/.local/share/uv/python and
+# descendants of this stage (`build`, `dev`, `csrc-build`,
+# `extensions-build`) inherit a root-owned, non-root-unreadable layout.
+# See #15174, #15359, #31959. Child stages inherit these via Dockerfile
+# `ENV` unless they override them explicitly.
+ENV UV_HTTP_TIMEOUT=500
+ENV UV_INDEX_STRATEGY="unsafe-best-match"
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+ENV UV_CACHE_DIR=/opt/uv/cache
+ENV UV_INSTALL_DIR=/opt/uv/bin
+ENV PATH="/opt/venv/bin:/opt/uv/bin:$PATH"
+ENV VIRTUAL_ENV="/opt/venv"
+
 # Install system dependencies including build tools
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
@@ -117,31 +134,25 @@ RUN apt-get update -y \
     # Ubuntu 20.04/22.04 where python3.x-dev is not available without a PPA)
     && (apt-get install -y --no-install-recommends python${PYTHON_VERSION}-dev 2>/dev/null || true) \
     && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" "${UV_INSTALL_DIR}" \
+    && chmod -R a+rX /opt/uv \
     && curl -LsSf https://astral.sh/uv/install.sh | sh \
-    && $HOME/.local/bin/uv venv /opt/venv --python ${PYTHON_VERSION} \
+    # `--seed` installs pip/setuptools/wheel into the venv so `python3 -m
+    # pip` works regardless of how uv happens to link the venv back to the
+    # managed Python install (which, at a non-default UV_PYTHON_INSTALL_DIR,
+    # doesn't always expose ensurepip via the default venv layout).
+    && uv venv --seed /opt/venv --python ${PYTHON_VERSION} \
     && rm -f /usr/bin/python3 /usr/bin/python3-config /usr/bin/pip \
     && ln -s /opt/venv/bin/python3 /usr/bin/python3 \
     && ln -s /opt/venv/bin/python3-config /usr/bin/python3-config \
     && ln -s /opt/venv/bin/pip /usr/bin/pip \
     && python3 --version && python3 -m pip --version
 
-# Activate virtual environment and add uv to PATH
-ENV PATH="/opt/venv/bin:/root/.local/bin:$PATH"
-ENV VIRTUAL_ENV="/opt/venv"
-
-# Environment for uv
-# Redirect uv's managed Python and download cache out of /root/ so that
-# images extending this one (or `docker run --user <non-root>:<gid>`) can
-# read and execute them. See #15174, #15359, #31959. Child stages (`build`,
-# `test`, `vllm-base`, etc.) inherit these via Dockerfile `ENV` unless they
-# override them explicitly.
-ENV UV_HTTP_TIMEOUT=500
-ENV UV_INDEX_STRATEGY="unsafe-best-match"
+# UV_LINK_MODE=copy applies to subsequent `uv pip install` RUNs (avoids
+# hardlink failures with BuildKit cache mounts); it must not be set during
+# `uv venv` above, which relies on hardlinking /opt/venv back to the
+# managed Python source so ensurepip / `python3 -m pip` still resolve.
 ENV UV_LINK_MODE=copy
-ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
-ENV UV_CACHE_DIR=/opt/uv/cache
-RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" \
-    && chmod -R a+rX /opt/uv
 
 # Verify GCC version
 RUN gcc --version
